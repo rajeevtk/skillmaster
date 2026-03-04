@@ -1,0 +1,6 @@
+project_id        = "your-gcp-project-id"
+region            = "us-central1"
+service_name      = "skillmaster"
+gcs_bucket_name   = "skillmaster-skills"
+anthropic_api_key = "sk-ant-..."
+neondb_url        = "postgresql://user:pass@ep-xxx.us-east-2.aws.neon.tech/skillmaster"
