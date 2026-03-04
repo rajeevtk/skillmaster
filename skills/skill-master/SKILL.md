@@ -62,7 +62,7 @@ Generate a SKILL.md following these rules:
 Check against the rules in [VALIDATION.md](VALIDATION.md). Fix any errors and re-validate.
 
 **Step 6: Store**
-Upload to GCS bucket (resolved from env var or org/team settings in NeonDB).
+Upload to GCS bucket. Bucket is determined by `SKILLMASTER_STORAGE_MODE`: set to `env` to use a fixed bucket from `SKILLMASTER_GCS_BUCKET`, or `db` for multi-tenant lookup per org/team from NeonDB.
 
 ## Supported input types
 

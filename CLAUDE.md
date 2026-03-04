@@ -60,8 +60,10 @@ See [skills/skill-master/SKILL.md](skills/skill-master/SKILL.md) for the Skill M
 
 Copy `.env.example` to `.env` and fill in:
 - `ANTHROPIC_API_KEY` — Required for Claude API access
-- `SKILLMASTER_GCS_BUCKET` — Default GCS bucket (overridable per org via NeonDB)
-- `NEONDB_URL` — Connection string for org/team settings (optional)
+- `SKILLMASTER_STORAGE_MODE` — `env` (default: use bucket from env var) or `db` (multi-tenant NeonDB lookup)
+- `SKILLMASTER_GCS_BUCKET` — GCS bucket name (used when STORAGE_MODE=env)
+- `SKILLMASTER_GCS_PROJECT` — GCP project ID for GCS client
+- `NEONDB_URL` — NeonDB connection string (required when STORAGE_MODE=db)
 
 ## Development Guidelines
 

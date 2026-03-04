@@ -171,7 +171,7 @@ skillmaster/
   - `list_skills(prefix, bucket_name)` → list of skill metadata
 - `src/skillmaster/storage/config_resolver.py`:
   - `resolve_bucket(org_id, team_id)` → bucket name
-  - Priority: env var `SKILLMASTER_GCS_BUCKET` → NeonDB lookup → default bucket
+  - Controlled by `SKILLMASTER_STORAGE_MODE` flag: `env` (use `SKILLMASTER_GCS_BUCKET` directly) or `db` (multi-tenant NeonDB lookup per org/team)
 - `src/skillmaster/db/connection.py`: async connection pool to NeonDB
 - `src/skillmaster/db/queries.py`:
   - `get_org_settings(org_id)` → bucket, preferences
@@ -369,9 +369,10 @@ Create `skills/skill-master/GTM_TEMPLATES.md` with templates for common GTM use 
 | Variable | Description | Default |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Claude API key | (required) |
-| `SKILLMASTER_GCS_BUCKET` | Default GCS bucket for skill storage | `skillmaster-skills` |
+| `SKILLMASTER_STORAGE_MODE` | Storage mode: `env` = use GCS_BUCKET, `db` = NeonDB lookup | `env` |
+| `SKILLMASTER_GCS_BUCKET` | GCS bucket name (used when STORAGE_MODE=env) | `skillmaster-skills` |
 | `SKILLMASTER_GCS_PROJECT` | GCP project ID | (required for GCS) |
-| `NEONDB_URL` | NeonDB connection string | (optional) |
+| `NEONDB_URL` | NeonDB connection string (required when STORAGE_MODE=db) | — |
 | `SKILLMASTER_PORT` | Service port | `8080` |
 | `SKILLMASTER_LOG_LEVEL` | Logging level | `INFO` |
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCP service account key path | (auto on Cloud Run) |
@@ -383,7 +384,7 @@ Create `skills/skill-master/GTM_TEMPLATES.md` with templates for common GTM use 
 1. **Python over TypeScript**: Better GCP client libraries, audio processing, and Google Slides API support
 2. **FastAPI**: Async-first, automatic OpenAPI docs, Pydantic validation
 3. **NeonDB**: Serverless Postgres — scales to zero, no ops overhead, compatible with asyncpg
-4. **Config resolution priority**: env var → NeonDB lookup → default. Simple for dev, flexible for multi-tenant prod
+4. **Explicit storage mode flag** (`SKILLMASTER_STORAGE_MODE`): `env` for single-tenant (use env var bucket), `db` for multi-tenant NeonDB lookup — no implicit cascading
 5. **Skill-creator pattern**: Follow the analyze → draft → validate → iterate loop from the official skill-creator skill
 6. **Progressive disclosure in generated skills**: Main SKILL.md stays concise, reference files for details
 7. **GTM focus**: Templates and domain knowledge baked into the generation prompts, not hard-coded in output
