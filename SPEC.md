@@ -1,270 +1,257 @@
 # Skill Whisperer — Service Specification
 
-## Overview
+## What Is Skill Whisperer
 
-Skill Whisperer is a service that converts unstructured knowledge from non-technical GTM (sales & marketing) users into validated, deployable Claude Agent Skill definitions. Users share knowledge via Google Docs, Google Slides, or (in future phases) voice conversations. The service processes these inputs through an analysis and compliance pipeline, producing `SKILL.md` files and associated asset folders that are deployed to Google Cloud Storage for consumption by Poexis agents.
+Skill Whisperer is a service that turns informal, unstructured knowledge from non-technical business users into validated, deployable agent skill definitions. A salesperson describes how they work — in a Google Doc, a slide deck, or eventually a voice conversation — and Skill Whisperer converts that into a structured `SKILL.md` with supporting asset files, applies organizational compliance rules, and deploys the result to Google Cloud Storage where Poexis agents pick it up and use it.
 
-This spec builds on the existing Skill Master codebase, evolving it into a production-grade, multi-tenant, loosely coupled system.
-
----
-
-## 1. User Personas
-
-### 1.1 End User — GTM Practitioner
-
-- **Role:** Non-technical user in sales, marketing, or customer success
-- **Technical level:** Comfortable with Google Docs/Slides; no coding skills
-- **Inputs they produce:**
-  - Account-specific demand generation guidelines
-  - Named stakeholder profiles and preferences
-  - Competitive intelligence and objection-handling playbooks
-  - Campaign workflows and approval chains
-  - Territory-specific selling motions
-- **Interaction model (MVP):** Shares a Google Doc or Google Slide deck with the Skill Whisperer service account. The service detects the share, processes the document, and produces a skill folder in GCS.
-- **Interaction model (future):** Speaks with a voice agent that conducts a structured interview and captures responses into skills.
-
-### 1.2 Skill Consumer — Poexis Agent
-
-- **Role:** Downstream Claude-based agent in the Poexis platform
-- **Interaction:** Reads skill definitions from a well-known GCS path (`gs://{bucket}/skills/{org_id}/{skill_id}/SKILL.md`)
-- **Expectation:** Skills are valid, compliant with the agent skills specification, and immediately usable without manual editing.
-
-### 1.3 Platform Admin
-
-- **Role:** Technical user who configures org/team policies, compliance rules, and pipeline settings
-- **Interaction:** Manages configuration via API or database records
-- **Introduced in:** Phase 3+
+The service is built for Poexis and runs on Google Cloud (Cloud Run, GCS, AlloyDB).
 
 ---
 
-## 2. Architecture
+## 1. Personas
 
-### 2.1 Design Principles
+### The End User: GTM Practitioner
 
-| Principle | Rationale |
-|-----------|-----------|
-| **Loosely coupled pipelines** | Each processing stage is an independent, swappable component connected via well-defined data contracts. New pipelines (voice, Slack, email) plug in without modifying core logic. |
-| **Observable by default** | Every pipeline stage emits structured logs, traces, and metrics. Failures are visible, debuggable, and alertable. |
-| **Event-driven ingestion** | Input sources trigger processing via events (Google Drive webhooks, Pub/Sub messages), not polling. |
-| **Idempotent processing** | Re-processing the same document produces the same skill output. Safe to retry. |
-| **Multi-tenant from day one** | Org/team isolation at the storage and policy layer, even if MVP starts single-tenant. |
+A non-technical person in sales or marketing. They do not write code. They create content in tools they already use — Google Docs and Google Slides.
 
-### 2.2 High-Level Architecture
+**What they produce:**
+- Account-specific demand generation guidelines
+- Named stakeholder profiles with personal preferences
+- Objection-handling playbooks
+- Territory-specific selling motions
+- Campaign execution checklists
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        INPUT SOURCES                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐           │
-│  │ Google   │  │ Google   │  │  Voice   │  │  Direct  │           │
-│  │  Docs    │  │ Slides   │  │  Agent   │  │   API    │           │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘           │
-│       │              │              │              │                 │
-└───────┼──────────────┼──────────────┼──────────────┼─────────────────┘
-        │              │              │              │
-        ▼              ▼              ▼              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     INGESTION LAYER                                 │
-│  ┌──────────────────────────────────────────────────────────┐      │
-│  │  Event Router (Cloud Run + Pub/Sub)                      │      │
-│  │  - Google Drive webhook receiver                         │      │
-│  │  - API request handler                                   │      │
-│  │  - Publishes IngestEvent to processing topic             │      │
-│  └──────────────────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    PROCESSING PIPELINE                               │
-│                                                                     │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌──────────────┐  │
-│  │ 1. Extract │  │ 2. Analyze │  │ 3. Generate│  │ 4. Validate  │  │
-│  │            │→ │            │→ │            │→ │ & Comply     │  │
-│  │ Parse doc, │  │ Classify   │  │ Produce    │  │ Lint, policy │  │
-│  │ normalize  │  │ use case,  │  │ SKILL.md + │  │ checks,      │  │
-│  │ content    │  │ extract    │  │ asset files │  │ org rules    │  │
-│  │            │  │ structure  │  │            │  │              │  │
-│  └────────────┘  └────────────┘  └────────────┘  └──────────────┘  │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     DEPLOYMENT LAYER                                │
-│  ┌──────────────────────────────────────────────────────────┐      │
-│  │  Skill Deployer                                          │      │
-│  │  - Writes skill folder to GCS                            │      │
-│  │  - Records metadata in AlloyDB                           │      │
-│  │  - Emits SkillDeployed event                             │      │
-│  └──────────────────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     CONSUMPTION LAYER                                │
-│  ┌──────────────────────────────────────────────────────────┐      │
-│  │  Poexis Agents                                           │      │
-│  │  - Read skills from GCS: gs://{bucket}/skills/{org}/{id} │      │
-│  │  - SKILL.md + referenced asset files                     │      │
-│  └──────────────────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**How they interact (MVP):** They write a Google Doc or build a Google Slide deck describing how they do their work. They share that document with the Skill Whisperer service. That action kicks off the entire workflow. They don't need to visit a separate app or learn a new tool.
 
-### 2.3 Data Contracts
+**How they interact (future):** They talk to a voice agent that interviews them — asks follow-up questions, probes for details — and captures the conversation into a skill.
 
-#### IngestEvent
+### The Skill Consumer: Poexis Agent
 
-```json
-{
-  "event_id": "uuid",
-  "source_type": "google_docs | google_slides | voice | api",
-  "source_ref": "document_id or API request_id",
-  "org_id": "string",
-  "team_id": "string (optional)",
-  "user_email": "string",
-  "timestamp": "ISO8601",
-  "metadata": {}
-}
-```
+A downstream Claude-based agent in the Poexis platform. It reads skill definitions from a known GCS location (`gs://{bucket}/skills/{org_id}/{skill_id}/SKILL.md`). It expects skills to be valid, complete, and immediately usable.
 
-#### ProcessedContent
+### The Platform Admin (Phase 3+)
 
-```json
-{
-  "event_id": "uuid",
-  "raw_text": "string",
-  "source_type": "string",
-  "structured_sections": [
-    {"title": "string", "body": "string", "type": "heading | qa | slide | speaker_turn"}
-  ],
-  "extracted_assets": [
-    {"name": "string", "type": "image | table | chart", "content_ref": "string"}
-  ],
-  "metadata": {}
-}
-```
+A technical user who configures organization policies, compliance rules, and pipeline settings. Manages the system through API or admin tooling.
 
-#### SkillBundle
+---
 
-```json
-{
-  "skill_id": "uuid",
-  "org_id": "string",
-  "name": "string",
-  "description": "string",
-  "skill_md": "string (SKILL.md content)",
-  "additional_files": {"relative_path": "content"},
-  "validation_result": {
-    "is_valid": true,
-    "errors": [],
-    "warnings": [],
-    "policy_violations": []
-  },
-  "source_event_id": "uuid",
-  "created_at": "ISO8601"
-}
-```
-
-### 2.4 Skill Folder Structure (Output)
+## 2. Core Workflow
 
 ```
-gs://{bucket}/skills/{org_id}/{skill_id}/
-├── SKILL.md              # Main skill definition (< 500 lines)
-├── metadata.json         # Provenance: source doc, timestamps, validation
-├── assets/               # Referenced files
-│   ├── stakeholders.md   # e.g., account stakeholder profiles
-│   ├── playbook.md       # e.g., objection handling scripts
-│   └── guidelines.md     # e.g., demand gen guidelines
-└── .validation/          # Audit trail
-    └── report.json       # Full validation + compliance report
+ End User                    Skill Whisperer                        Poexis
+ ────────                    ───────────────                        ──────
+
+ Writes Google Doc
+ or Slide Deck
+       │
+       │  shares with
+       │  service account
+       ▼
+                     ┌─────────────────────────┐
+                     │  1. DETECT              │
+                     │  Google Drive webhook    │
+                     │  notices the share       │
+                     └───────────┬─────────────┘
+                                 │
+                                 ▼
+                     ┌─────────────────────────┐
+                     │  2. EXTRACT             │
+                     │  Read doc via Docs/     │
+                     │  Slides API. Parse      │
+                     │  headings, bullets,     │
+                     │  speaker notes, images  │
+                     └───────────┬─────────────┘
+                                 │
+                                 ▼
+                     ┌─────────────────────────┐
+                     │  3. ANALYZE             │
+                     │  Classify the use case. │
+                     │  Extract entities,      │
+                     │  workflows, structure.  │
+                     └───────────┬─────────────┘
+                                 │
+                                 ▼
+                     ┌─────────────────────────┐
+                     │  4. GENERATE            │
+                     │  Produce SKILL.md +     │
+                     │  asset files following  │
+                     │  agent skills spec.     │
+                     └───────────┬─────────────┘
+                                 │
+                                 ▼
+                     ┌─────────────────────────┐
+                     │  5. VALIDATE & COMPLY   │
+                     │  Structural checks.     │
+                     │  Org policy checks.     │
+                     │  Linting and style.     │
+                     │  Loop if fixable.       │
+                     └───────────┬─────────────┘
+                                 │
+                                 ▼
+                     ┌─────────────────────────┐
+                     │  6. DEPLOY              │
+                     │  Write skill folder     │
+                     │  to GCS. Record meta-   │
+                     │  data in AlloyDB.       │
+                     └───────────┬─────────────┘
+                                 │
+                                 ▼
+                                              Poexis agents read
+                                              from GCS and use
+                                              the skill at runtime
 ```
 
 ---
 
-## 3. Infrastructure
+## 3. Architecture Principles
 
-### 3.1 Compute
+**Loosely coupled pipelines.** Each stage (extract, analyze, generate, validate, deploy) is an independent component with a clear input/output contract. Swapping or adding a new extractor (e.g., voice) does not require changes to the generator or validator.
 
-| Component | Service | Purpose |
-|-----------|---------|---------|
-| API + Pipeline | Google Cloud Run | Hosts FastAPI app, processes pipeline |
-| Event Ingestion | Cloud Run + Pub/Sub | Receives Drive webhooks, queues processing |
-| Async Workers (future) | Cloud Run Jobs | Long-running voice processing, batch ops |
+**Observable.** Every pipeline stage emits structured logs with a correlation ID that follows the request from ingestion to deployment. Stage durations, errors, and outcomes are recorded in AlloyDB for debugging and analytics.
 
-### 3.2 Storage
+**Extensible input sources.** The MVP supports Google Docs and Google Slides. The architecture treats these as pluggable "extractors" behind a common interface. Adding voice, Slack, email, or any other input source means writing a new extractor — the rest of the pipeline is unchanged.
 
-| Component | Service | Purpose |
-|-----------|---------|---------|
-| Skill Output | Google Cloud Storage | Deployed skill folders consumed by Poexis agents |
-| Metadata & Config | AlloyDB (PostgreSQL) | Org/team config, skill metadata, audit logs, policy rules |
+**Idempotent processing.** Re-processing the same document at the same revision produces the same output. Safe to retry on failure.
+
+**Multi-tenant from the start.** Org-scoped storage paths and configuration, even if the MVP serves a single organization.
+
+---
+
+## 4. System Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       INPUT SOURCES                              │
+│                                                                  │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
+│  │ Google Docs  │   │Google Slides│   │ Voice Agent │           │
+│  │             │   │             │   │  (future)   │           │
+│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘           │
+│         │                  │                  │                   │
+│         └────────┬─────────┘                  │                   │
+│                  │ (MVP)                      │ (Phase 3+)       │
+└──────────────────┼────────────────────────────┼──────────────────┘
+                   │                            │
+                   ▼                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    INGESTION LAYER                                │
+│                                                                  │
+│  Google Drive Webhook Receiver (Cloud Run)                       │
+│  - Detects shares / edits                                        │
+│  - Determines document type (Doc vs Slides)                      │
+│  - Deduplicates by document_id + revision_id                     │
+│  - Dispatches to processing pipeline                             │
+│                                                                  │
+│  Also: POST /api/v1/skills/generate (manual trigger / API use)  │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   PROCESSING PIPELINE                             │
+│                                                                  │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐ │
+│  │ Extract  │──▶│ Analyze  │──▶│ Generate │──▶│  Validate &  │ │
+│  │          │   │          │   │          │   │   Comply      │ │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────────┘ │
+│                                                                  │
+│  Each stage: independent, traced, retryable                      │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    DEPLOYMENT LAYER                               │
+│                                                                  │
+│  - Writes skill folder to GCS                                    │
+│  - Records metadata in AlloyDB                                   │
+│  - (Phase 4+) Emits SkillDeployed event to Pub/Sub              │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                   GOOGLE CLOUD STORAGE                            │
+│                                                                  │
+│  gs://{bucket}/skills/{org_id}/{skill_id}/                       │
+│  ├── SKILL.md                                                    │
+│  ├── metadata.json                                               │
+│  ├── assets/                                                     │
+│  │   ├── stakeholders.md                                         │
+│  │   ├── playbook.md                                             │
+│  │   └── ...                                                     │
+│  └── .validation/                                                │
+│      └── report.json                                             │
+│                                                                  │
+│  Poexis agents read from here.                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Infrastructure
+
+| Component | GCP Service | Purpose |
+|-----------|-------------|---------|
+| API + Pipeline | Cloud Run | Hosts the FastAPI app, runs the processing pipeline |
+| Skill Output Store | Google Cloud Storage | Deployed skill folders; Poexis agents read from here |
+| Metadata & Config | AlloyDB (PostgreSQL) | Org config, skill records, processing logs, policy rules |
+| Document Access | Google Docs API, Slides API | Read shared documents |
+| Change Detection | Google Drive Push Notifications | Webhook when documents are shared or updated |
 | Secrets | Secret Manager | API keys, service account credentials |
-
-### 3.3 Integration
-
-| Component | Service | Purpose |
-|-----------|---------|---------|
-| Document Access | Google Drive API + Docs/Slides API | Read shared documents |
-| Change Detection | Google Drive Push Notifications (webhooks) | Detect when docs are shared/updated |
-| Event Bus | Cloud Pub/Sub | Decouple ingestion from processing |
+| Event Bus (Phase 4+) | Cloud Pub/Sub | Decouple ingestion from processing |
 | Observability | Cloud Logging + Cloud Trace | Structured logs, distributed tracing |
 
-### 3.4 AlloyDB Schema (replaces NeonDB)
+### AlloyDB Schema
 
 ```sql
--- Organization configuration
 CREATE TABLE organizations (
     org_id          TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     gcs_bucket      TEXT NOT NULL,
-    skill_prefix    TEXT DEFAULT 'skills',
-    policies        JSONB DEFAULT '{}',
+    config          JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Team configuration (inherits from org)
 CREATE TABLE teams (
     team_id         TEXT PRIMARY KEY,
     org_id          TEXT REFERENCES organizations(org_id),
     name            TEXT NOT NULL,
-    gcs_bucket      TEXT,  -- override org bucket if set
-    policies        JSONB DEFAULT '{}',
+    gcs_bucket      TEXT,             -- optional override
+    config          JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Skill metadata and audit trail
 CREATE TABLE skills (
     skill_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     org_id          TEXT REFERENCES organizations(org_id),
     team_id         TEXT REFERENCES teams(team_id),
     name            TEXT NOT NULL,
     description     TEXT,
-    source_type     TEXT NOT NULL,
-    source_ref      TEXT,           -- Google Doc ID, etc.
-    source_user     TEXT,           -- email of the person who shared
+    source_type     TEXT NOT NULL,    -- google_docs, google_slides, voice, api
+    source_ref      TEXT,             -- document ID
+    source_user     TEXT,             -- email of person who shared
     gcs_path        TEXT NOT NULL,
-    status          TEXT DEFAULT 'active',  -- active, archived, draft
+    status          TEXT DEFAULT 'active',
     version         INTEGER DEFAULT 1,
     validation_result JSONB,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Processing event log (observability)
 CREATE TABLE processing_events (
     event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     skill_id        UUID REFERENCES skills(skill_id),
-    stage           TEXT NOT NULL,  -- extract, analyze, generate, validate, deploy
-    status          TEXT NOT NULL,  -- started, completed, failed
+    stage           TEXT NOT NULL,    -- extract, analyze, generate, validate, deploy
+    status          TEXT NOT NULL,    -- started, completed, failed
     duration_ms     INTEGER,
     details         JSONB,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Organization policy rules
+-- Phase 2+
 CREATE TABLE policy_rules (
     rule_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     org_id          TEXT REFERENCES organizations(org_id),
-    rule_type       TEXT NOT NULL,  -- terminology, banned_content, required_section, style
+    rule_type       TEXT NOT NULL,    -- banned_terms, required_sections, terminology, style, pii
     rule_config     JSONB NOT NULL,
     enabled         BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMPTZ DEFAULT NOW()
@@ -273,119 +260,135 @@ CREATE TABLE policy_rules (
 
 ---
 
-## 4. Pipeline Stages (Detail)
+## 6. Pipeline Stage Detail
 
-### 4.1 Extract
+### 6.1 Extract
 
-Responsible for pulling content from the source and normalizing it into `ProcessedContent`.
+Reads the source document and produces normalized, structured content.
 
 **Google Docs extractor:**
-- Uses Google Docs API to read document structure (headings, paragraphs, lists, tables)
-- Preserves heading hierarchy as section structure
-- Extracts inline images → saves to assets
-- Handles comments as supplementary context
+- Calls Docs API `documents.get` to read the full document
+- Maps HEADING_1–6 to a section hierarchy
+- Extracts paragraphs, numbered/bulleted lists, tables
+- Downloads inline images, stores as asset references
+- Treats document comments as supplementary context
 
 **Google Slides extractor:**
-- Uses Google Slides API to read slides in order
-- Extracts: slide titles, bullet points, speaker notes, images
-- Speaker notes treated as high-signal content (the user's verbal explanation)
+- Calls Slides API `presentations.get` to read all slides
+- For each slide: extracts title, body text, bullet points, speaker notes
+- Speaker notes are treated as high-signal (the user's verbal explanation of the slide)
 - Reconstructs narrative flow from slide order
+- Downloads images, stores as asset references
 
-### 4.2 Analyze
+**Common output contract:**
 
-Uses Claude to classify and structure the extracted content.
+```
+ProcessedContent:
+    source_type: str
+    raw_text: str
+    sections: list[{title, body, type}]
+    assets: list[{name, type, content_ref}]
+    metadata: dict
+```
 
-- **GTM use-case classification:** Maps input to one of the defined GTM categories (sales-enablement, lead-scoring, pipeline-management, etc.)
-- **Complexity assessment:** simple / moderate / complex — drives how many reference files to generate
-- **Entity extraction:** People names, company names, product names, processes
-- **Structure detection:** Identifies if the content maps to a workflow, a reference guide, a playbook, or a decision tree
+Any future extractor (voice, email, Slack) produces the same `ProcessedContent`. This is the decoupling point.
 
-### 4.3 Generate
+### 6.2 Analyze
 
-Uses Claude to produce the SKILL.md and any referenced asset files.
+Uses Claude to understand what the user wrote and how to structure it as a skill.
 
-- Follows Anthropic's agent skill authoring best practices
-- SKILL.md body stays under 500 lines
-- Complex content is split into reference files (progressive disclosure)
-- Generated skills include concrete examples relevant to the detected GTM use case
-- Supports re-generation with validator feedback (max 2 iterations)
+- Classifies the GTM use case (demand gen, account planning, objection handling, competitive intel, etc.)
+- Assesses complexity (simple reference vs. multi-step workflow)
+- Extracts named entities (people, companies, products)
+- Detects structure: is this a playbook? a reference guide? a decision tree? a workflow?
+- Outputs an analysis object that guides the generator
 
-### 4.4 Validate & Comply
+### 6.3 Generate
 
-Multi-layer validation:
+Uses Claude to produce the actual skill definition files.
 
-1. **Structural validation** (existing): YAML frontmatter rules, body length, reference depth
-2. **Content linting** (new): Consistent terminology, no time-sensitive language, third-person voice
-3. **Organization policy checks** (new): Custom rules loaded from AlloyDB per org
-   - Banned terminology or competitor mentions
-   - Required sections (e.g., every skill must have a "Compliance" section)
-   - Style rules (tone, formality level)
+- Generates `SKILL.md` following the agent skills specification
+  - Valid YAML frontmatter (`name`, `description`)
+  - Body under 500 lines
+  - Progressive disclosure: complex content split into referenced asset files
+  - Concrete examples relevant to the detected use case
+- Generates referenced asset files (stakeholder profiles, playbooks, guidelines, etc.)
+- Supports a feedback loop: if validation fails, re-generates with error context (max 2 retries)
+
+### 6.4 Validate & Comply
+
+Multi-layer checks before a skill is deployed:
+
+1. **Structural validation** — YAML frontmatter rules, body length limits, reference depth
+2. **Content linting** — Consistent terminology, no time-sensitive language, appropriate tone
+3. **Org policy checks (Phase 2+)** — Custom rules per organization:
+   - Banned terms (competitor names, profanity)
+   - Required sections
+   - Terminology enforcement
    - PII detection and redaction
-4. **Skill spec compliance**: Validates against the Claude Agent Skills specification
+4. **Agent skills spec compliance** — Validates the output is a well-formed skill definition
 
-### 4.5 Deploy
+Violations can be **blocking** (skill not deployed) or **warning** (deployed with flag).
 
-- Writes the skill folder to GCS at the org-scoped path
-- Records metadata in AlloyDB
-- Emits a `SkillDeployed` event (Pub/Sub) for downstream consumers
-- Poexis agents discover new/updated skills via GCS path convention or event subscription
+### 6.5 Deploy
+
+- Writes the skill folder to GCS at `gs://{bucket}/skills/{org_id}/{skill_id}/`
+- Records the skill in AlloyDB with full metadata
+- Logs a processing event for the deploy stage
+- (Phase 4+) Publishes a `SkillDeployed` event
 
 ---
 
-## 5. MVP Scope
+## 7. MVP Scope
 
-The MVP delivers a focused, end-to-end flow:
+### In Scope
 
-**Input:** User shares a Google Doc or Google Slides deck with the Skill Whisperer service account.
+- **Google Docs** as an input source — share a doc, get a skill
+- **Google Slides** as an input source — share a deck, get a skill
+- **Google Drive webhook receiver** — detects shares, triggers processing
+- **Full processing pipeline** — extract, analyze, generate, validate, deploy
+- **GCS deployment** — skill folders at org-scoped paths
+- **AlloyDB** — skill metadata, processing event log, org config
+- **Manual API trigger** — `POST /api/v1/skills/generate` as fallback
+- **Structural + content validation** — no custom org policies yet
+- **Structured logging** with correlation IDs
+- **Terraform** for Cloud Run, GCS, AlloyDB, IAM
+- **Health and readiness endpoints**
 
-**Processing:** The service extracts content, analyzes it, generates a SKILL.md + asset files, validates the output, and deploys to GCS.
-
-**Output:** A skill folder in GCS that Poexis agents can consume.
-
-### MVP Includes
-
-- Google Docs and Google Slides as input sources
-- Google Drive webhook receiver to detect shared documents
-- Full processing pipeline (extract → analyze → generate → validate → deploy)
-- GCS deployment with org-scoped paths
-- AlloyDB for skill metadata and basic org config
-- Structural + content validation (no custom org policies yet)
-- Health check and basic observability (structured logging)
-- Terraform for Cloud Run, GCS, AlloyDB, IAM
-- FastAPI with `/api/v1/skills/generate` endpoint (manual trigger fallback)
-
-### MVP Excludes
+### Out of Scope (MVP)
 
 - Voice agent input
 - Custom organization policy rules
-- Pub/Sub event bus (MVP uses synchronous processing)
-- Platform admin UI
+- Pub/Sub event bus (synchronous processing in MVP)
+- Admin UI
 - Skill versioning and diff
-- Multi-region deployment
+- Multi-region
 - Batch processing
+- Slack, email, or browser extension inputs
 
 ---
 
-## 6. Non-Functional Requirements
+## 8. Non-Functional Requirements
 
 | Requirement | Target |
 |-------------|--------|
-| Latency (end-to-end) | < 60s for a typical 10-page Google Doc |
+| End-to-end latency | < 60 seconds for a typical 10-page document |
 | Availability | 99.5% (Cloud Run SLA) |
-| Concurrent processing | 10 simultaneous skill generations (MVP) |
-| Skill output quality | Zero structural validation errors; warnings acceptable |
+| Concurrent processing | 10 simultaneous generations (MVP) |
+| Skill output quality | Zero structural errors; warnings acceptable |
 | Tenant isolation | Org-scoped GCS paths; no cross-org data leakage |
-| Observability | Structured JSON logs; per-stage duration tracking |
-| Security | Service account with least-privilege IAM; no user credentials stored |
+| Observability | Structured JSON logs; per-stage duration tracking in AlloyDB |
+| Security | Least-privilege IAM; no user credentials stored; docs accessed via service account |
 
 ---
 
-## 7. Future Phases (Preview)
+## 9. Phase Roadmap
 
-| Phase | Capability |
-|-------|------------|
-| **Phase 2 — Policies & Compliance** | Org-specific policy rules, PII detection, compliance audit trail |
-| **Phase 3 — Voice Agent** | Interview-style voice input via telephony integration |
-| **Phase 4 — Event-Driven Pipeline** | Pub/Sub decoupling, async processing, retry/DLQ |
-| **Phase 5 — Multi-Experience** | Slack bot, email ingestion, Chrome extension |
-| **Phase 6 — Enterprise** | Multi-region, RBAC, skill versioning, approval workflows |
+| Phase | Name | What It Adds |
+|-------|------|-------------|
+| **1 — MVP** | Google Docs to GCS | Docs/Slides input, full pipeline, GCS deploy, AlloyDB metadata |
+| **2 — Policies** | Org Compliance | Custom policy rules engine, policy CRUD API, compliance audit trail |
+| **3 — Voice** | Interview Agent | Voice agent conducts structured interviews, captures into skills |
+| **4 — Events** | Async Pipeline | Pub/Sub decoupling, async processing, retry/DLQ, job status API |
+| **5 — Multi-Experience** | More Input Sources | Slack bot, email ingestion, Chrome extension |
+| **6 — Enterprise** | Production Hardening | RBAC, skill versioning, approval workflows, multi-region, SSO |
