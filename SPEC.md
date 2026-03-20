@@ -2,7 +2,7 @@
 
 ## What Is Skill Whisperer
 
-Skill Whisperer converts unstructured knowledge from non-technical business users into validated agent skill definitions. A salesperson describes how they work — in a Google Doc, a slide deck, or eventually a voice conversation — and Skill Whisperer produces a structured `SKILL.md` with supporting asset files, tagged with a three-level ownership hierarchy and arbitrary metadata.
+Skill Whisperer converts unstructured knowledge from non-technical business users into validated agent skill definitions. A salesperson describes how they work — in a Google Doc or eventually a voice conversation — and Skill Whisperer produces a structured `SKILL.md` with supporting asset files, tagged with a three-level ownership hierarchy and arbitrary metadata.
 
 Skill Whisperer's scope ends at producing the skill bundle. Deployment to runtime infrastructure, lifecycle management (versioning, archival, promotion), and agent consumption are handled by separate downstream services that read Skill Whisperer's output.
 
@@ -12,7 +12,7 @@ Skill Whisperer's scope ends at producing the skill bundle. Deployment to runtim
 
 ### Skill Whisperer owns:
 
-- Ingesting content from input sources (Google Docs, Slides, future: voice)
+- Ingesting content from input sources (Google Docs, future: voice)
 - Extracting and normalizing that content
 - Analyzing it to determine structure and use case
 - Generating a valid SKILL.md + asset files compliant with the agent skills spec
@@ -37,7 +37,7 @@ Downstream services read the skill bundles from GCS and handle everything from t
 
 ### The End User: GTM Practitioner
 
-A non-technical person in sales or marketing. They do not write code. They create content in tools they already use — Google Docs and Google Slides.
+A non-technical person in sales or marketing. They do not write code. They create content in a tool they already use — Google Docs.
 
 **What they produce:**
 - Account-specific demand generation guidelines
@@ -46,7 +46,7 @@ A non-technical person in sales or marketing. They do not write code. They creat
 - Territory-specific selling motions
 - Campaign execution checklists
 
-**How they interact (MVP):** They write a Google Doc or build a Google Slide deck describing how they do their work. They share that document with the Skill Whisperer service. That action kicks off the entire workflow. They don't need to visit a separate app or learn a new tool.
+**How they interact (MVP):** They write a Google Doc describing how they do their work. They share that document with the Skill Whisperer service. That action kicks off the entire workflow. They don't need to visit a separate app or learn a new tool.
 
 **How they interact (future):** They talk to a voice agent that interviews them — asks follow-up questions, probes for details — and captures the conversation into a skill.
 
@@ -88,7 +88,7 @@ In addition to the ownership hierarchy, each skill carries a flat set of key-val
 
 | Tag | Description | Example value |
 |-----|-------------|---------------|
-| `source_type` | Input source that produced this skill | `google_docs`, `google_slides`, `voice` |
+| `source_type` | Input source that produced this skill | `google_docs`, `voice` |
 | `source_ref` | Reference to the original document | `1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms` |
 | `gtm_use_case` | Detected GTM category | `demand-generation`, `objection-handling`, `account-planning` |
 | `complexity` | Assessed complexity level | `simple`, `moderate`, `complex` |
@@ -160,7 +160,6 @@ Downstream services use the path structure and `metadata.json` to discover, filt
  ────────                    ───────────────
 
  Writes Google Doc
- or Slide Deck
        │
        │  shares with
        │  service account
@@ -174,10 +173,10 @@ Downstream services use the path structure and `metadata.json` to discover, filt
                                  ▼
                      ┌─────────────────────────┐
                      │  2. EXTRACT             │
-                     │  Read doc via Docs/     │
-                     │  Slides API. Parse      │
-                     │  headings, bullets,     │
-                     │  speaker notes, images  │
+                     │  Read doc via Docs API. │
+                     │  Parse headings,        │
+                     │  bullets, tables,       │
+                     │  images                 │
                      └───────────┬─────────────┘
                                  │
                                  ▼
@@ -226,7 +225,7 @@ Downstream services use the path structure and `metadata.json` to discover, filt
 
 **Observable.** Every pipeline stage emits structured logs with a correlation ID that follows the request from ingestion through output. Stage durations, errors, and outcomes are recorded in AlloyDB for debugging and analytics.
 
-**Extensible input sources.** The MVP supports Google Docs and Google Slides. The architecture treats these as pluggable "extractors" behind a common interface. Adding voice, Slack, email, or any other input source means writing a new extractor — the rest of the pipeline is unchanged.
+**Extensible input sources.** The MVP supports Google Docs. The architecture treats input sources as pluggable "extractors" behind a common interface. Adding voice, Slack, email, or any other input source means writing a new extractor — the rest of the pipeline is unchanged.
 
 **Idempotent processing.** Re-processing the same document at the same revision produces the same output. Safe to retry on failure.
 
@@ -240,13 +239,12 @@ Downstream services use the path structure and `metadata.json` to discover, filt
 ┌──────────────────────────────────────────────────────────────────┐
 │                       INPUT SOURCES                              │
 │                                                                  │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐           │
-│  │ Google Docs  │   │Google Slides│   │ Voice Agent │           │
-│  │             │   │             │   │  (future)   │           │
-│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘           │
-│         │                  │                  │                   │
-│         └────────┬─────────┘                  │                   │
-│                  │ (MVP)                      │ (Phase 3+)       │
+│  ┌─────────────┐   ┌─────────────┐                              │
+│  │ Google Docs  │   │ Voice Agent │                              │
+│  │   (MVP)     │   │  (future)   │                              │
+│  └──────┬──────┘   └──────┬──────┘                              │
+│         │                  │                                      │
+│         │ (MVP)            │ (Phase 3+)                          │
 └──────────────────┼────────────────────────────┼──────────────────┘
                    │                            │
                    ▼                            ▼
@@ -255,7 +253,6 @@ Downstream services use the path structure and `metadata.json` to discover, filt
 │                                                                  │
 │  Google Drive Webhook Receiver                                   │
 │  - Detects shares / edits                                        │
-│  - Determines document type (Doc vs Slides)                      │
 │  - Resolves ownership tags (org/project/user)                    │
 │  - Deduplicates by document_id + revision_id                     │
 │  - Dispatches to processing pipeline                             │
@@ -372,19 +369,12 @@ Note: `skill_outputs` is an output log, not a lifecycle table. It tracks "what d
 
 Reads the source document and produces normalized, structured content.
 
-**Google Docs extractor:**
+**Google Docs extractor (MVP):**
 - Calls Docs API `documents.get` to read the full document
 - Maps HEADING_1–6 to a section hierarchy
 - Extracts paragraphs, numbered/bulleted lists, tables
 - Downloads inline images, stores as asset references
 - Treats document comments as supplementary context
-
-**Google Slides extractor:**
-- Calls Slides API `presentations.get` to read all slides
-- For each slide: extracts title, body text, bullet points, speaker notes
-- Speaker notes are treated as high-signal (the user's verbal explanation of the slide)
-- Reconstructs narrative flow from slide order
-- Downloads images, stores as asset references
 
 **Common output contract:**
 
@@ -452,7 +442,6 @@ Violations can be **blocking** (skill not output) or **warning** (output with fl
 ### In Scope
 
 - **Google Docs** as an input source — share a doc, get a skill
-- **Google Slides** as an input source — share a deck, get a skill
 - **Google Drive webhook receiver** — detects shares, triggers processing
 - **Full processing pipeline** — extract, analyze, generate, validate, output
 - **Tag envelope** — three-level ownership hierarchy + auto-populated and user-supplied tags
@@ -498,7 +487,7 @@ Violations can be **blocking** (skill not output) or **warning** (output with fl
 
 | Phase | Name | What It Adds |
 |-------|------|-------------|
-| **1 — MVP** | Google Docs to GCS | Docs/Slides input, full pipeline, tagged skill bundles to GCS |
+| **1 — MVP** | Google Docs to GCS | Google Docs input, full pipeline, tagged skill bundles to GCS |
 | **2 — Policies** | Org Compliance | Custom policy rules engine, policy CRUD API, compliance audit trail |
 | **3 — Voice** | Interview Agent | Voice agent conducts structured interviews, captures into skills |
 | **4 — Events** | Async Pipeline | Pub/Sub decoupling, async processing, retry/DLQ |

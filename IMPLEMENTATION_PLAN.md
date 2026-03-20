@@ -8,7 +8,7 @@ Reminder: Skill Whisperer produces tagged skill bundles and writes them to GCS. 
 
 ## Phase 1 — MVP: Google Docs to Tagged Skill Bundle
 
-**Outcome:** A user shares a Google Doc or Slide deck with the service account. The service detects the share, extracts content, generates a validated skill definition, tags it with the ownership hierarchy and metadata, and writes it to GCS.
+**Outcome:** A user shares a Google Doc with the service account. The service detects the share, extracts content, generates a validated skill definition, tags it with the ownership hierarchy and metadata, and writes it to GCS.
 
 ---
 
@@ -30,8 +30,7 @@ skill-whisperer/
 │       │   └── models.py             # Request/response Pydantic models
 │       ├── extractors/
 │       │   ├── __init__.py            # ExtractorRouter, ProcessedContent dataclass
-│       │   ├── google_docs.py         # Google Docs API extractor
-│       │   └── google_slides.py       # Google Slides API extractor
+│       │   └── google_docs.py         # Google Docs API extractor
 │       ├── pipeline/
 │       │   ├── __init__.py            # SkillBundle dataclass
 │       │   ├── orchestrator.py        # Runs extract → analyze → generate → validate → output
@@ -91,7 +90,7 @@ PORT                           — 8080 default
 - `pydantic`, `pydantic-settings`
 - `anthropic` (Claude API)
 - `google-cloud-storage`
-- `google-api-python-client`, `google-auth` (Drive, Docs, Slides APIs)
+- `google-api-python-client`, `google-auth` (Drive, Docs APIs)
 - `asyncpg` (AlloyDB/PostgreSQL)
 - `pyyaml`, `python-multipart`
 - Dev: `pytest`, `pytest-asyncio`, `httpx`, `ruff`
@@ -186,29 +185,7 @@ class ProcessedContent:
 
 ---
 
-### Step 1.4 — Google Slides Extractor
-
-**File:** `src/skill_whisperer/extractors/google_slides.py`
-
-- Takes a Google Slides presentation ID
-- Calls `slides.presentations.get()` to retrieve all slides
-- For each slide, extracts:
-  - Slide title (from title placeholder)
-  - Body text and bullet points
-  - Speaker notes (high-signal — the user's verbal explanation)
-  - Images (downloaded, added to assets)
-- Reconstructs slides in order as a narrative flow
-- Each slide becomes a `Section`
-
-**Tests:**
-- Extracts title and body from mock slides
-- Speaker notes are captured and labeled
-- Slide ordering is preserved
-- Handles slides with only images
-
----
-
-### Step 1.5 — Extractor Router
+### Step 1.4 — Extractor Router
 
 **File:** `src/skill_whisperer/extractors/__init__.py`
 
@@ -218,17 +195,15 @@ Simple dispatch:
 async def extract(source_type: str, source_ref: str, credentials) -> ProcessedContent:
     if source_type == "google_docs":
         return await google_docs_extract(source_ref, credentials)
-    elif source_type == "google_slides":
-        return await google_slides_extract(source_ref, credentials)
     else:
         raise ValueError(f"Unknown source type: {source_type}")
 ```
 
-Extension point for future sources.
+Extension point for future sources (voice, Slack, etc.).
 
 ---
 
-### Step 1.6 — Analysis Stage
+### Step 1.5 — Analysis Stage
 
 **File:** `src/skill_whisperer/pipeline/analyzer.py`
 
@@ -258,7 +233,7 @@ class AnalysisResult:
 
 ---
 
-### Step 1.7 — Generation Stage
+### Step 1.6 — Generation Stage
 
 **File:** `src/skill_whisperer/pipeline/generator.py`
 
@@ -285,7 +260,7 @@ class SkillBundle:
 
 ---
 
-### Step 1.8 — Validation Stage
+### Step 1.7 — Validation Stage
 
 **File:** `src/skill_whisperer/pipeline/validator.py`
 
@@ -315,7 +290,7 @@ class ValidationResult:
 
 ---
 
-### Step 1.9 — Pipeline Orchestrator
+### Step 1.8 — Pipeline Orchestrator
 
 **File:** `src/skill_whisperer/pipeline/orchestrator.py`
 
@@ -346,7 +321,7 @@ Each stage is wrapped with the observability decorator that logs start/end/durat
 
 ---
 
-### Step 1.10 — GCS Output
+### Step 1.9 — GCS Output
 
 **File:** `src/skill_whisperer/output/gcs.py`
 
@@ -371,7 +346,7 @@ The only read Skill Whisperer does is from AlloyDB `skill_outputs` for dedup.
 
 ---
 
-### Step 1.11 — AlloyDB Layer
+### Step 1.10 — AlloyDB Layer
 
 **File:** `src/skill_whisperer/db/connection.py`
 - `asyncpg` connection pool to AlloyDB
@@ -392,7 +367,7 @@ The only read Skill Whisperer does is from AlloyDB `skill_outputs` for dedup.
 
 ---
 
-### Step 1.12 — Google Drive Webhook
+### Step 1.11 — Google Drive Webhook
 
 **File:** `src/skill_whisperer/api/webhooks.py`
 
@@ -402,7 +377,7 @@ The only read Skill Whisperer does is from AlloyDB `skill_outputs` for dedup.
 - On `change` or `update`:
   1. Gets file ID from `X-Goog-Resource-ID`
   2. Calls Drive API for file metadata (MIME type, title, sharing info, last modifier email)
-  3. Determines source type from MIME type
+  3. Confirms MIME type is `application/vnd.google-apps.document` (ignores other types)
   4. Resolves ownership: org + project from configuration, user from the last modifier email
   5. Dedup check: `skill_already_processed(source_ref, source_revision)`
   6. Runs the pipeline orchestrator
@@ -414,7 +389,7 @@ The only read Skill Whisperer does is from AlloyDB `skill_outputs` for dedup.
 
 ---
 
-### Step 1.13 — API Routes
+### Step 1.12 — API Routes
 
 **File:** `src/skill_whisperer/api/routes.py`
 
@@ -455,7 +430,7 @@ Returns:
 
 ---
 
-### Step 1.14 — Observability
+### Step 1.13 — Observability
 
 **File:** `src/skill_whisperer/observability.py`
 
@@ -471,15 +446,15 @@ Returns:
 
 ---
 
-### Step 1.15 — Tests
+### Step 1.14 — Tests
 
 | Test file | What it covers |
 |-----------|---------------|
 | `test_tagging.py` | Ownership validation, tag merging precedence, project defaults, key normalization |
-| `test_extractors.py` | Docs heading extraction, Slides narrative flow, empty doc handling |
+| `test_extractors.py` | Docs heading extraction, list/table parsing, empty doc handling |
 | `test_pipeline.py` | Orchestrator wires stages correctly, retry on validation failure, tags attached to bundle |
 | `test_validator.py` | All validation rules (frontmatter, name, description, body length, reserved words) |
-| `test_webhooks.py` | Drive notification parsing, dedup logic, MIME type routing, ownership resolution |
+| `test_webhooks.py` | Drive notification parsing, dedup logic, MIME type filtering, ownership resolution |
 | `test_output.py` | GCS path uses ownership hierarchy, metadata.json contains full tag envelope |
 
 ---
@@ -490,23 +465,22 @@ Returns:
 Week 1: Foundation
   ├── 1.1  Project scaffold, config, FastAPI app shell, health endpoint
   ├── 1.2  Tagging model + resolver (core contract, no dependencies)
-  ├── 1.11 AlloyDB connection + migrations
-  ├── 1.14 Observability (logging, tracing decorator)
-  └── 1.8  Validator (no external dependencies, easy to test first)
+  ├── 1.10 AlloyDB connection + migrations
+  ├── 1.13 Observability (logging, tracing decorator)
+  └── 1.7  Validator (no external dependencies, easy to test first)
 
-Week 2: Extractors + Pipeline
+Week 2: Extractor + Pipeline
   ├── 1.3  Google Docs extractor
-  ├── 1.4  Google Slides extractor
-  ├── 1.5  Extractor router
-  ├── 1.6  Analyzer (Claude integration + auto-tagging)
-  └── 1.7  Generator (Claude integration)
+  ├── 1.4  Extractor router
+  ├── 1.5  Analyzer (Claude integration + auto-tagging)
+  └── 1.6  Generator (Claude integration)
 
 Week 3: Wiring + Output
-  ├── 1.9  Pipeline orchestrator (wire everything, integrate tag resolver)
-  ├── 1.10 GCS output (write-only, metadata.json with tag envelope)
-  ├── 1.13 API routes
-  ├── 1.12 Drive webhook receiver
-  └── 1.15 Tests for all components
+  ├── 1.8  Pipeline orchestrator (wire everything, integrate tag resolver)
+  ├── 1.9  GCS output (write-only, metadata.json with tag envelope)
+  ├── 1.12 API routes
+  ├── 1.11 Drive webhook receiver
+  └── 1.14 Tests for all components
 
 Week 4: Polish + E2E
   ├── Dockerfile
@@ -518,7 +492,6 @@ Week 4: Polish + E2E
 ### Phase 1 — Exit Criteria
 
 - [ ] Share a Google Doc → tagged skill bundle appears in GCS with correct `{org}/{project}/{skill_id}/` path
-- [ ] Share a Google Slides deck → same result
 - [ ] `POST /api/v1/skills/generate` with ownership + tags produces a valid, tagged skill bundle
 - [ ] `metadata.json` contains complete tag envelope (ownership + auto-tags + user-tags)
 - [ ] Generated SKILL.md passes all structural validation rules
