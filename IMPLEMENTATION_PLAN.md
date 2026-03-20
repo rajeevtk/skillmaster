@@ -2,17 +2,19 @@
 
 This document breaks down the Skill Whisperer service into concrete implementation phases. Each phase delivers a working, testable system.
 
+Reminder: Skill Whisperer produces tagged skill bundles and writes them to GCS. It does not manage skill lifecycle, deploy to agents, or provision infrastructure. See SPEC.md for scope boundaries.
+
 ---
 
-## Phase 1 — MVP: Google Docs to GCS
+## Phase 1 — MVP: Google Docs to Tagged Skill Bundle
 
-**Outcome:** A user shares a Google Doc or Slide deck with the service account. The service detects the share, extracts content, generates a validated skill definition, and deploys it to GCS where Poexis agents can read it.
+**Outcome:** A user shares a Google Doc or Slide deck with the service account. The service detects the share, extracts content, generates a validated skill definition, tags it with the ownership hierarchy and metadata, and writes it to GCS.
 
 ---
 
 ### Step 1.1 — Project Scaffold
 
-Create the project from scratch with the following structure:
+Create the project from scratch:
 
 ```
 skill-whisperer/
@@ -23,44 +25,41 @@ skill-whisperer/
 │       ├── config.py                  # Pydantic Settings, all env vars
 │       ├── api/
 │       │   ├── __init__.py
-│       │   ├── routes.py              # POST /generate, GET /skills, GET /skills/{id}
+│       │   ├── routes.py              # POST /generate, GET /skills/{id}
 │       │   ├── webhooks.py            # POST /webhooks/drive
-│       │   └── models.py              # Request/response Pydantic models
+│       │   └── models.py             # Request/response Pydantic models
 │       ├── extractors/
 │       │   ├── __init__.py            # ExtractorRouter, ProcessedContent dataclass
 │       │   ├── google_docs.py         # Google Docs API extractor
 │       │   └── google_slides.py       # Google Slides API extractor
 │       ├── pipeline/
 │       │   ├── __init__.py            # SkillBundle dataclass
-│       │   ├── orchestrator.py        # Runs extract → analyze → generate → validate → deploy
-│       │   ├── analyzer.py            # Claude-based input classification
+│       │   ├── orchestrator.py        # Runs extract → analyze → generate → validate → output
+│       │   ├── analyzer.py            # Claude-based classification + auto-tagging
 │       │   ├── generator.py           # Claude-based SKILL.md generation
 │       │   └── validator.py           # Structural + content validation
-│       ├── storage/
+│       ├── tagging/
 │       │   ├── __init__.py
-│       │   └── gcs.py                 # Upload/download/list skill folders
+│       │   ├── models.py             # Ownership, TagEnvelope dataclasses
+│       │   └── resolver.py           # Merges ownership + auto-tags + user-tags + project defaults
+│       ├── output/
+│       │   ├── __init__.py
+│       │   └── gcs.py                 # Write skill bundle + metadata.json to GCS
 │       ├── db/
 │       │   ├── __init__.py
 │       │   ├── connection.py          # AlloyDB async connection pool
-│       │   ├── queries.py             # SQL queries for orgs, skills, events
+│       │   ├── queries.py             # SQL queries for orgs, projects, skill_outputs, events
 │       │   └── migrations/
 │       │       └── 001_initial.sql    # Schema creation
 │       └── observability.py           # Structured logging, correlation IDs, stage tracing
-├── terraform/
-│   ├── main.tf                        # Provider, API enablement
-│   ├── variables.tf                   # Input variables
-│   ├── cloud_run.tf                   # Cloud Run service
-│   ├── gcs.tf                         # GCS bucket
-│   ├── alloydb.tf                     # AlloyDB cluster + instance
-│   ├── iam.tf                         # Service accounts, roles, secrets
-│   └── outputs.tf                     # Service URL, bucket name, etc.
 ├── tests/
 │   ├── conftest.py
 │   ├── test_extractors.py
 │   ├── test_pipeline.py
 │   ├── test_validator.py
+│   ├── test_tagging.py
 │   ├── test_webhooks.py
-│   └── test_storage.py
+│   └── test_output.py
 ├── Dockerfile
 ├── pyproject.toml
 ├── .env.example
@@ -68,20 +67,23 @@ skill-whisperer/
 ```
 
 **Key decisions:**
-- Package name: `skill_whisperer` (not `skillmaster`)
-- Directory `extractors/` instead of `processors/` — clearer name for what it does
-- `ProcessedContent` is the universal data contract between extractors and the pipeline
+- Package name: `skill_whisperer`
+- `extractors/` — input-side, pluggable per source type
+- `tagging/` — dedicated module for the ownership + metadata tag system
+- `output/` — not `storage/`, not `deploy/` — this is write-only output
+- `pipeline/` — the core processing stages
+- No `terraform/` directory — infrastructure is a separate concern
 
 **Config (env vars):**
 ```
-ANTHROPIC_API_KEY          — Claude API access
+ANTHROPIC_API_KEY              — Claude API access
 GOOGLE_APPLICATION_CREDENTIALS — Service account key for Drive/Docs/Slides API
-GCS_BUCKET                 — Skill output bucket
-GCP_PROJECT                — GCP project ID
-ALLOYDB_URL                — AlloyDB connection string
-DRIVE_WEBHOOK_SECRET       — Shared secret for webhook verification
-LOG_LEVEL                  — INFO default
-PORT                       — 8080 default
+GCS_BUCKET                     — Output bucket for skill bundles
+GCP_PROJECT                    — GCP project ID
+ALLOYDB_URL                    — AlloyDB connection string
+DRIVE_WEBHOOK_SECRET           — Shared secret for webhook verification
+LOG_LEVEL                      — INFO default
+PORT                           — 8080 default
 ```
 
 **Dependencies:**
@@ -96,11 +98,52 @@ PORT                       — 8080 default
 
 ---
 
-### Step 1.2 — Google Docs Extractor
+### Step 1.2 — Tagging Model
+
+**Files:** `src/skill_whisperer/tagging/models.py`, `src/skill_whisperer/tagging/resolver.py`
+
+This is the core contract between Skill Whisperer and every downstream service. Build it first.
+
+**Data model:**
+
+```python
+@dataclass
+class Ownership:
+    org: str        # e.g., "acme-corp"
+    project: str    # e.g., "enterprise-west-q2"
+    user: str       # e.g., "jdoe@acme.com"
+
+@dataclass
+class TagEnvelope:
+    skill_id: str
+    ownership: Ownership
+    tags: dict[str, str]         # flat key-value pairs
+    validation: ValidationResult | None
+```
+
+**Auto-populated tags** (set by the analyzer):
+- `source_type`, `source_ref`, `gtm_use_case`, `complexity`, `structure_type`, `generated_at`, `pipeline_version`
+
+**Tag resolver** (`resolver.py`):
+1. Start with project default tags (from `projects.default_tags` in AlloyDB)
+2. Layer on auto-populated tags from the analyzer
+3. Layer on user-supplied tags from the API request
+4. Later wins (user-supplied overrides auto, auto overrides project defaults)
+5. Validate: `ownership.org`, `ownership.project`, `ownership.user` must all be non-empty
+6. Return `TagEnvelope`
+
+**Tests:**
+- Three-level hierarchy must be complete (reject if any level missing)
+- User-supplied tags override auto tags
+- Project default tags are applied
+- Tag keys are normalized (lowercase, hyphens)
+
+---
+
+### Step 1.3 — Google Docs Extractor
 
 **File:** `src/skill_whisperer/extractors/google_docs.py`
 
-**What it does:**
 - Takes a Google Doc document ID
 - Calls `docs.documents.get()` to retrieve the full document
 - Walks the document body, extracting:
@@ -111,7 +154,7 @@ PORT                       — 8080 default
   - Inline images → downloaded, added to assets list
 - Returns a `ProcessedContent` object
 
-**ProcessedContent contract:**
+**ProcessedContent contract** (defined in `extractors/__init__.py`):
 ```python
 @dataclass
 class Section:
@@ -143,17 +186,16 @@ class ProcessedContent:
 
 ---
 
-### Step 1.3 — Google Slides Extractor
+### Step 1.4 — Google Slides Extractor
 
 **File:** `src/skill_whisperer/extractors/google_slides.py`
 
-**What it does:**
 - Takes a Google Slides presentation ID
 - Calls `slides.presentations.get()` to retrieve all slides
 - For each slide, extracts:
   - Slide title (from title placeholder)
   - Body text and bullet points
-  - Speaker notes (high-signal — this is where the user explains the slide verbally)
+  - Speaker notes (high-signal — the user's verbal explanation)
   - Images (downloaded, added to assets)
 - Reconstructs slides in order as a narrative flow
 - Each slide becomes a `Section`
@@ -166,7 +208,7 @@ class ProcessedContent:
 
 ---
 
-### Step 1.4 — Extractor Router
+### Step 1.5 — Extractor Router
 
 **File:** `src/skill_whisperer/extractors/__init__.py`
 
@@ -182,15 +224,14 @@ async def extract(source_type: str, source_ref: str, credentials) -> ProcessedCo
         raise ValueError(f"Unknown source type: {source_type}")
 ```
 
-This is the extension point. Adding voice or Slack means adding a new extractor and one more branch here.
+Extension point for future sources.
 
 ---
 
-### Step 1.5 — Analysis Stage
+### Step 1.6 — Analysis Stage
 
 **File:** `src/skill_whisperer/pipeline/analyzer.py`
 
-**What it does:**
 - Takes `ProcessedContent`, sends it to Claude for classification
 - Claude identifies:
   - **GTM use case** — demand generation, account planning, objection handling, competitive intel, customer success, campaign execution, territory planning, stakeholder management, etc.
@@ -198,33 +239,34 @@ This is the extension point. Adding voice or Slack means adding a new extractor 
   - **Content structure** — playbook, reference guide, decision tree, workflow checklist, profile collection
   - **Named entities** — people, companies, products, processes
   - **Suggested skill name and description**
+- Returns auto-tag values along with the analysis
 
 **Output:**
 ```python
 @dataclass
 class AnalysisResult:
     use_case: str
-    complexity: str  # simple, moderate, complex
+    complexity: str
     structure_type: str
     entities: list[dict]
     suggested_name: str
     suggested_description: str
     key_topics: list[str]
+    auto_tags: dict[str, str]   # gtm_use_case, complexity, structure_type
     raw_analysis: dict
 ```
 
 ---
 
-### Step 1.6 — Generation Stage
+### Step 1.7 — Generation Stage
 
 **File:** `src/skill_whisperer/pipeline/generator.py`
 
-**What it does:**
 - Takes `ProcessedContent` + `AnalysisResult`
-- Sends to Claude with a system prompt that instructs it to produce a valid agent skill definition
+- Sends to Claude with a system prompt for agent skill definition authoring
 - Generates:
   - `SKILL.md` — valid YAML frontmatter + body under 500 lines
-  - Asset files — for complex content, splits into referenced files (e.g., `assets/stakeholders.md`, `assets/playbook.md`)
+  - Asset files — for complex content, splits into referenced files
 - Uses progressive disclosure: SKILL.md is the entry point, asset files hold the detail
 - Supports re-generation with validation feedback (max 2 retries)
 
@@ -238,11 +280,12 @@ class SkillBundle:
     skill_md: str
     additional_files: dict[str, str]  # relative_path → content
     analysis: AnalysisResult
+    tag_envelope: TagEnvelope         # resolved tags attached to the bundle
 ```
 
 ---
 
-### Step 1.7 — Validation Stage
+### Step 1.8 — Validation Stage
 
 **File:** `src/skill_whisperer/pipeline/validator.py`
 
@@ -272,7 +315,7 @@ class ValidationResult:
 
 ---
 
-### Step 1.8 — Pipeline Orchestrator
+### Step 1.9 — Pipeline Orchestrator
 
 **File:** `src/skill_whisperer/pipeline/orchestrator.py`
 
@@ -285,7 +328,10 @@ extract(source_type, source_ref) → ProcessedContent
 analyze(processed_content) → AnalysisResult
     │
     ▼
-generate(processed_content, analysis) → SkillBundle
+resolve_tags(ownership, analysis.auto_tags, user_tags, project_defaults) → TagEnvelope
+    │
+    ▼
+generate(processed_content, analysis) → SkillBundle (with tag_envelope attached)
     │
     ▼
 validate(skill_bundle.skill_md) → ValidationResult
@@ -293,141 +339,135 @@ validate(skill_bundle.skill_md) → ValidationResult
     ├── if errors and retries < 2: re-generate with feedback → loop back to validate
     │
     ▼
-deploy(skill_bundle, org_id) → gcs_path
+write_output(skill_bundle) → gcs_path
 ```
 
-Each stage is wrapped with the observability decorator that logs start/end/duration and writes to the `processing_events` table.
+Each stage is wrapped with the observability decorator that logs start/end/duration and writes to `processing_events`.
 
 ---
 
-### Step 1.9 — GCS Storage
+### Step 1.10 — GCS Output
 
-**File:** `src/skill_whisperer/storage/gcs.py`
-
-**Functions:**
+**File:** `src/skill_whisperer/output/gcs.py`
 
 ```python
-async def upload_skill(skill_bundle: SkillBundle, org_id: str, bucket: str) -> str:
+async def write_skill_bundle(bundle: SkillBundle, bucket: str) -> str:
     """
-    Writes:
-      gs://{bucket}/skills/{org_id}/{skill_id}/SKILL.md
-      gs://{bucket}/skills/{org_id}/{skill_id}/metadata.json
-      gs://{bucket}/skills/{org_id}/{skill_id}/assets/{filename}
-      gs://{bucket}/skills/{org_id}/{skill_id}/.validation/report.json
+    Writes to GCS using the ownership hierarchy as the path:
+
+      gs://{bucket}/{org}/{project}/{skill_id}/SKILL.md
+      gs://{bucket}/{org}/{project}/{skill_id}/metadata.json
+      gs://{bucket}/{org}/{project}/{skill_id}/assets/{filename}
+
+    metadata.json contains the full TagEnvelope (ownership + tags + validation).
 
     Returns the GCS path prefix.
     """
-
-async def download_skill(skill_id: str, org_id: str, bucket: str) -> dict | None:
-    """Returns SKILL.md content and metadata, or None."""
-
-async def list_skills(org_id: str, bucket: str) -> list[dict]:
-    """Lists all skill folders for an org."""
 ```
 
-**Path convention:** `skills/{org_id}/{skill_id}/` — this is what Poexis agents look for.
+This is a write-only interface. Skill Whisperer never reads back from this path. No `download_skill`, no `list_skills` at the GCS level — that's downstream's job.
+
+The only read Skill Whisperer does is from AlloyDB `skill_outputs` for dedup.
 
 ---
 
-### Step 1.10 — AlloyDB Layer
+### Step 1.11 — AlloyDB Layer
 
 **File:** `src/skill_whisperer/db/connection.py`
-- Creates an `asyncpg` connection pool to AlloyDB
-- Supports AlloyDB Auth Proxy (connect via Unix socket or localhost proxy)
-- Pool: min 1, max 10 connections
+- `asyncpg` connection pool to AlloyDB
+- Supports AlloyDB Auth Proxy
+- Pool: min 1, max 10
 
 **File:** `src/skill_whisperer/db/queries.py`
-- `create_skill(org_id, name, description, source_type, source_ref, source_user, gcs_path, validation_result) → skill_id`
-- `get_skill(skill_id) → row`
-- `list_skills(org_id, team_id=None) → list[row]`
-- `log_event(skill_id, stage, status, duration_ms, details)`
 - `get_org(org_id) → row`
+- `get_project(project_id) → row` (includes `default_tags`)
 - `get_org_bucket(org_id) → str`
+- `record_skill_output(skill_id, org_id, project_id, user_email, name, description, source_type, source_ref, source_revision, gcs_path, tags, validation_result)`
+- `skill_already_processed(source_ref, source_revision) → bool` (dedup check)
+- `log_event(skill_id, stage, status, duration_ms, details)`
 
 **File:** `src/skill_whisperer/db/migrations/001_initial.sql`
-- Creates all tables from the schema in SPEC.md (except `policy_rules` — that's Phase 2)
+- Creates: `organizations`, `projects`, `skill_outputs`, `processing_events`
+- No `policy_rules` yet (Phase 2)
 
 ---
 
-### Step 1.11 — Google Drive Webhook
+### Step 1.12 — Google Drive Webhook
 
 **File:** `src/skill_whisperer/api/webhooks.py`
 
-**Endpoints:**
-
 `POST /api/v1/webhooks/drive` — receives Drive push notifications
-- Validates the notification (channel token matches `DRIVE_WEBHOOK_SECRET`)
+- Validates notification (channel token matches `DRIVE_WEBHOOK_SECRET`)
 - Ignores `sync` messages (initial handshake)
 - On `change` or `update`:
-  1. Reads `X-Goog-Resource-ID` to get the file ID
-  2. Calls Drive API to get file metadata (MIME type, title, sharing info)
-  3. Determines source type from MIME type:
-     - `application/vnd.google-apps.document` → `google_docs`
-     - `application/vnd.google-apps.presentation` → `google_slides`
-  4. Checks if this document_id + revision has already been processed (dedup)
-  5. Runs the pipeline orchestrator
-  6. Returns 200 (Drive expects fast response; processing is synchronous in MVP)
+  1. Gets file ID from `X-Goog-Resource-ID`
+  2. Calls Drive API for file metadata (MIME type, title, sharing info, last modifier email)
+  3. Determines source type from MIME type
+  4. Resolves ownership: org + project from configuration, user from the last modifier email
+  5. Dedup check: `skill_already_processed(source_ref, source_revision)`
+  6. Runs the pipeline orchestrator
+  7. Returns 200
 
 `POST /api/v1/webhooks/drive/register` — registers a Drive watch
 - Takes a file ID or folder ID
 - Calls `files.watch()` to set up push notifications
-- Stores the channel ID for verification
-
-**Deduplication:** Before processing, check AlloyDB `skills` table for existing skill with same `source_ref` and same revision. Skip if already processed.
 
 ---
 
-### Step 1.12 — API Routes
+### Step 1.13 — API Routes
 
 **File:** `src/skill_whisperer/api/routes.py`
 
-`POST /api/v1/skills/generate` — manual trigger (fallback for testing and direct API use)
-- Body: `{ source_type, source_ref, org_id, team_id?, metadata? }`
-- Runs the full pipeline
-- Returns: `{ skill_id, name, status, gcs_path, validation_errors, skill_md_preview }`
+`POST /api/v1/skills/generate` — manual trigger
+```json
+{
+  "source_type": "google_docs",
+  "source_ref": "document_id",
+  "ownership": {
+    "org": "acme-corp",
+    "project": "enterprise-west-q2",
+    "user": "jdoe@acme.com"
+  },
+  "tags": {
+    "account": "globex-industries",
+    "region": "west"
+  }
+}
+```
+Returns:
+```json
+{
+  "skill_id": "uuid",
+  "name": "handling-globex-objections",
+  "gcs_path": "gs://bucket/acme-corp/enterprise-west-q2/uuid/",
+  "tag_envelope": { ... },
+  "validation": { "is_valid": true, "errors": [], "warnings": [] }
+}
+```
 
-`GET /api/v1/skills/{skill_id}` — retrieve a skill
-- Returns skill metadata from AlloyDB + SKILL.md content from GCS
+`GET /api/v1/skills/{skill_id}` — retrieve output record
+- Returns the `skill_outputs` row from AlloyDB (including tags snapshot)
+- Does NOT read from GCS
 
-`GET /api/v1/skills` — list skills
-- Query params: `org_id` (required), `team_id` (optional)
-- Returns list from AlloyDB
-
-`POST /api/v1/skills/validate` — validate without storing
-- Body: `{ skill_md: str }`
-- Returns: `{ is_valid, errors, warnings }`
+`POST /api/v1/skills/validate` — validate without producing output
+- Body: `{ "skill_md": "..." }`
+- Returns: `{ "is_valid": true, "errors": [], "warnings": [] }`
 
 ---
 
-### Step 1.13 — Observability
+### Step 1.14 — Observability
 
 **File:** `src/skill_whisperer/observability.py`
 
-- **Structured JSON logger:** Every log line includes `correlation_id`, `stage`, `org_id`, `skill_id`
-- **Correlation ID middleware:** Assigns a UUID to each request, threads it through all stages
+- **Structured JSON logger:** Every log line includes `correlation_id`, `stage`, `org_id`, `project_id`, `skill_id`
+- **Correlation ID middleware:** Assigns a UUID to each request, threads through all stages
 - **Stage tracing decorator:**
   ```python
   @trace_stage("analyze")
   async def analyze(content: ProcessedContent) -> AnalysisResult:
       ...
   ```
-  Automatically logs start/end, measures duration, writes to `processing_events`
-
----
-
-### Step 1.14 — Terraform
-
-**Files and what they provision:**
-
-| File | Resources |
-|------|-----------|
-| `main.tf` | Google provider, enable APIs (run, storage, alloydb, secretmanager, docs, slides, drive) |
-| `variables.tf` | project_id, region, service_name, gcs_bucket, alloydb vars, anthropic_api_key |
-| `cloud_run.tf` | Cloud Run v2 service, env vars, startup probe on /health |
-| `gcs.tf` | Bucket with uniform access, versioning, lifecycle rules |
-| `alloydb.tf` | AlloyDB cluster, primary instance, database, user |
-| `iam.tf` | Service account with GCS objectAdmin, AlloyDB client, Secret Manager accessor |
-| `outputs.tf` | service_url, gcs_bucket, service_account_email |
+  Logs start/end, measures duration, writes to `processing_events`
 
 ---
 
@@ -435,11 +475,12 @@ async def list_skills(org_id: str, bucket: str) -> list[dict]:
 
 | Test file | What it covers |
 |-----------|---------------|
-| `test_extractors.py` | Google Docs heading extraction, Slides narrative flow, empty doc handling |
-| `test_pipeline.py` | Orchestrator wires stages correctly, retry on validation failure |
+| `test_tagging.py` | Ownership validation, tag merging precedence, project defaults, key normalization |
+| `test_extractors.py` | Docs heading extraction, Slides narrative flow, empty doc handling |
+| `test_pipeline.py` | Orchestrator wires stages correctly, retry on validation failure, tags attached to bundle |
 | `test_validator.py` | All validation rules (frontmatter, name, description, body length, reserved words) |
-| `test_webhooks.py` | Drive notification parsing, dedup logic, MIME type routing |
-| `test_storage.py` | GCS path construction, org-scoped paths |
+| `test_webhooks.py` | Drive notification parsing, dedup logic, MIME type routing, ownership resolution |
+| `test_output.py` | GCS path uses ownership hierarchy, metadata.json contains full tag envelope |
 
 ---
 
@@ -448,49 +489,52 @@ async def list_skills(org_id: str, bucket: str) -> list[dict]:
 ```
 Week 1: Foundation
   ├── 1.1  Project scaffold, config, FastAPI app shell, health endpoint
-  ├── 1.10 AlloyDB connection + migrations
-  ├── 1.13 Observability (logging, tracing decorator)
-  └── 1.7  Validator (no external dependencies, easy to test)
+  ├── 1.2  Tagging model + resolver (core contract, no dependencies)
+  ├── 1.11 AlloyDB connection + migrations
+  ├── 1.14 Observability (logging, tracing decorator)
+  └── 1.8  Validator (no external dependencies, easy to test first)
 
 Week 2: Extractors + Pipeline
-  ├── 1.2  Google Docs extractor
-  ├── 1.3  Google Slides extractor
-  ├── 1.4  Extractor router
-  ├── 1.5  Analyzer (Claude integration)
-  └── 1.6  Generator (Claude integration)
+  ├── 1.3  Google Docs extractor
+  ├── 1.4  Google Slides extractor
+  ├── 1.5  Extractor router
+  ├── 1.6  Analyzer (Claude integration + auto-tagging)
+  └── 1.7  Generator (Claude integration)
 
-Week 3: Wiring + Deploy
-  ├── 1.8  Pipeline orchestrator (wire everything together)
-  ├── 1.9  GCS storage (org-scoped paths)
-  ├── 1.12 API routes
-  ├── 1.11 Drive webhook receiver
+Week 3: Wiring + Output
+  ├── 1.9  Pipeline orchestrator (wire everything, integrate tag resolver)
+  ├── 1.10 GCS output (write-only, metadata.json with tag envelope)
+  ├── 1.13 API routes
+  ├── 1.12 Drive webhook receiver
   └── 1.15 Tests for all components
 
-Week 4: Infrastructure + E2E
-  ├── 1.14 Terraform (Cloud Run, GCS, AlloyDB, IAM)
+Week 4: Polish + E2E
   ├── Dockerfile
-  ├── End-to-end test: share Google Doc → skill appears in GCS
+  ├── End-to-end test: share Google Doc → tagged skill bundle in GCS
+  ├── Verify metadata.json tag envelope is correct
   └── Bug fixes and hardening
 ```
 
 ### Phase 1 — Exit Criteria
 
-- [ ] Share a Google Doc with the service account → skill folder appears in GCS within 60 seconds
+- [ ] Share a Google Doc → tagged skill bundle appears in GCS with correct `{org}/{project}/{skill_id}/` path
 - [ ] Share a Google Slides deck → same result
-- [ ] `POST /api/v1/skills/generate` with a document ID produces a valid skill
+- [ ] `POST /api/v1/skills/generate` with ownership + tags produces a valid, tagged skill bundle
+- [ ] `metadata.json` contains complete tag envelope (ownership + auto-tags + user-tags)
 - [ ] Generated SKILL.md passes all structural validation rules
-- [ ] Skill metadata is recorded in AlloyDB
+- [ ] Auto-tags (`gtm_use_case`, `complexity`, `structure_type`) are populated by the analyzer
+- [ ] User-supplied tags override auto-tags when keys conflict
+- [ ] Project default tags are applied from AlloyDB `projects.default_tags`
+- [ ] Dedup: re-sharing the same doc at the same revision does not produce a duplicate
 - [ ] Processing events are logged for each pipeline stage
-- [ ] `GET /api/v1/skills?org_id=X` returns the generated skill
 - [ ] All tests pass
-- [ ] `terraform plan` succeeds with no errors
 - [ ] Structured JSON logs include correlation IDs
 
 ---
 
 ## Phase 2 — Organization Policies & Compliance
 
-**Outcome:** Organizations define custom rules (banned terms, required sections, terminology, PII detection). Skills are checked against these rules before deployment.
+**Outcome:** Organizations define custom rules (banned terms, required sections, terminology, PII detection). Skills are checked against these rules before output.
 
 ### Steps
 
@@ -507,18 +551,20 @@ Week 4: Infrastructure + E2E
 - `DELETE /api/v1/orgs/{org_id}/policies/{rule_id}`
 
 **2.3 — Pipeline integration**
-- Add policy check stage between validate and deploy in orchestrator
-- Blocking violations prevent deployment
+- Add policy check stage between validate and output in orchestrator
+- Blocking violations prevent output
+- Policy results included in `metadata.json` validation section
 - All results recorded in `processing_events`
 
 **2.4 — Compliance audit API**
-- `GET /api/v1/skills/{skill_id}/audit` — full processing + compliance history
+- `GET /api/v1/skills/{skill_id}/audit` — full processing + compliance history from `processing_events`
 
 ### Phase 2 — Exit Criteria
 
-- [ ] Create a "banned_terms" policy → skill containing banned term is blocked
+- [ ] Create a "banned_terms" policy → skill containing banned term is blocked from output
 - [ ] Create a "required_sections" policy → skill missing required section is blocked
-- [ ] Warnings do not block deployment
+- [ ] Warnings do not block output
+- [ ] Policy check results appear in `metadata.json`
 - [ ] Audit endpoint shows full compliance trail
 - [ ] Policy CRUD works end-to-end
 
@@ -526,7 +572,7 @@ Week 4: Infrastructure + E2E
 
 ## Phase 3 — Voice Agent Pipeline
 
-**Outcome:** A voice agent conducts a structured interview with the user. The conversation is transcribed and processed into a skill.
+**Outcome:** A voice agent conducts a structured interview with the user. The conversation is transcribed and processed into a tagged skill bundle.
 
 ### Steps
 
@@ -540,6 +586,7 @@ Week 4: Infrastructure + E2E
 - Speaker diarization to identify interviewer vs. user
 - Cleans filler words, normalizes text
 - Produces `ProcessedContent` like any other extractor
+- Sets `source_type` tag to `voice`
 
 **3.3 — Interview agent** (`src/skill_whisperer/extractors/interview_agent.py`)
 - Claude-powered agent that guides the conversation
@@ -551,8 +598,9 @@ Week 4: Infrastructure + E2E
 
 - [ ] User can start a voice session via WebSocket
 - [ ] Agent asks relevant follow-up questions
-- [ ] Completed session produces a valid skill in GCS
+- [ ] Completed session produces a valid tagged skill bundle in GCS
 - [ ] Voice-generated skills pass all validation
+- [ ] Tag envelope includes `source_type: voice`
 
 ---
 
@@ -563,9 +611,9 @@ Week 4: Infrastructure + E2E
 ### Steps
 
 **4.1 — Pub/Sub integration**
-- Topics: `skill-ingest-events`, `skill-deployed-events`, `skill-dlq`
+- Topics: `skill-ingest-events`, `skill-dlq`
 - Webhook handler publishes to Pub/Sub instead of calling pipeline directly
-- Cloud Run subscriber pulls from ingest topic
+- Subscriber pulls from ingest topic, runs pipeline
 
 **4.2 — Async API**
 - `POST /api/v1/skills/generate` returns 202 + job ID
@@ -575,35 +623,14 @@ Week 4: Infrastructure + E2E
 - Exponential backoff, max 3 attempts
 - Failed events land in `skill-dlq` for manual review
 
-**4.4 — Terraform**
-- Pub/Sub topics, subscriptions, DLQ
-- Cloud Run subscriber service
-
 ---
 
 ## Phase 5 — Multi-Experience Endpoints
 
 **Outcome:** Slack, email, and browser extension feed into the same pipeline.
 
-### Steps
-
 **5.1 — Slack bot** — paste content or share a doc link → triggers pipeline
 **5.2 — Email ingestion** — forward to `skills@domain` → email body processed
 **5.3 — Chrome extension** — highlight text, send to Skill Whisperer
 
-Each is a thin adapter that produces an `IngestEvent` and publishes to Pub/Sub. The core pipeline is unchanged.
-
----
-
-## Phase 6 — Enterprise
-
-**Outcome:** Production hardening for enterprise deployment.
-
-### Steps
-
-**6.1 — RBAC** — org admin, team editor, viewer roles
-**6.2 — Skill versioning** — track changes, diff between versions
-**6.3 — Approval workflows** — skills require approval before deployment
-**6.4 — Multi-region** — deploy to multiple GCP regions
-**6.5 — SSO** — SAML/OIDC integration
-**6.6 — Analytics** — skill creation volume, agent consumption stats
+Each is a thin adapter that produces an ingest event with ownership tags and publishes to Pub/Sub. The core pipeline is unchanged.
